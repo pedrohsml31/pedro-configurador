@@ -2,10 +2,10 @@
 #   powershell -ExecutionPolicy Bypass -File Configurar.ps1
 # Fora do repositório central, ele instala as ferramentas, autentica as contas, clona o repositório
 # central e continua a partir da cópia clonada. Dentro dele, mostra o menu.
-param([ValidateSet('Menu', 'Ferramentas', 'Contas', 'Regras', 'Instalar', 'Projetos', 'Atualizar', 'Catalogo')][string]$Acao = 'Menu')
+param([ValidateSet('Menu', 'Ferramentas', 'Contas', 'Regras', 'Instalar', 'Projetos', 'Atualizar', 'Catalogo', 'Sincronizar', 'Backup', 'Restaurar', 'Chaves', 'Janela')][string]$Acao = 'Menu')
 
 $NOME_PROGRAMA = 'Ambiente do Pedro'
-$VERSAO = '1.0'
+$VERSAO = '5.6'
 $TITULO_PROGRAMA = "$NOME_PROGRAMA v$VERSAO"
 # Sem 'Stop' global: no PowerShell 5.1 o stderr de programas nativos (gh devolve 404 quando não há release) viraria exceção.
 $ErrorActionPreference = 'Continue'
@@ -63,18 +63,21 @@ if (-not (Test-Path -LiteralPath (Join-Path $raizRepo 'scripts\lib.ps1'))) {
         try { & (Achar-Gh) repo clone $RepoCentral $destino } finally { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue }
         if ($LASTEXITCODE -ne 0) { throw 'Não consegui clonar o repositório central.' }
     }
-    & (Join-Path $destino 'Configurar.ps1') -Acao $Acao
+    # Fim do PC novo: cria o atalho e abre a janela (a menos que uma ação específica tenha sido pedida).
+    if ($Acao -eq 'Menu') { & (Join-Path $destino 'scripts\Janela.ps1') -CriarAtalho } else { & (Join-Path $destino 'Configurar.ps1') -Acao $Acao }
     return
 }
 
 . (Join-Path $raizRepo 'scripts\lib.ps1')
+. (Join-Path $raizRepo 'scripts\chaves-ia.ps1')
 $cfg = Obter-Config
+$VERSAO = (Get-Content -LiteralPath (Join-Path $raizRepo 'VERSION') -Raw).Trim()
+$TITULO_PROGRAMA = "$NOME_PROGRAMA v$VERSAO"
 $host.UI.RawUI.WindowTitle = $TITULO_PROGRAMA
 
 function Aplicar-Regras {
     # Backup do que já existe, diferença visível e confirmação antes de sobrescrever. Só instruções compartilháveis.
     $fonte = Join-Path $raizRepo 'chezmoi'
-    git -C $raizRepo pull --ff-only --quiet 2>$null   # só avança em linha reta; se divergir, não faz nada
     chezmoi diff --source $fonte --destination $HOME
     if ((Read-Host 'Aplicar estas regras? Cópias .bak-<data> serão guardadas (s/N)') -notmatch '^[sS]') { return }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
@@ -86,9 +89,8 @@ function Aplicar-Regras {
 }
 
 function Mostrar-Catalogo {
-    $cat = Obter-Catalogo
-    $cat | Sort-Object Tipo, Conta, Repo | Format-Table Conta, Repo, Tipo, Versao, Privado -AutoSize
-    return $cat
+    . (Join-Path $raizRepo 'scripts\mapa.ps1')
+    Mostrar-MapaProgramas
 }
 
 function Menu-Principal {
@@ -97,7 +99,10 @@ function Menu-Principal {
         Write-Host '1 Instalar ferramentas (git, gh, chezmoi)   5 Preparar projetos para desenvolvimento'
         Write-Host '2 Autenticar contas GitHub                  6 Atualizar programas instalados'
         Write-Host '3 Regras do Codex e Claude (chezmoi)        7 Ligar/desligar atualização automática'
-        Write-Host '4 Instalar programas                        8 Ver catálogo completo      0 Sair'
+        Write-Host '4 Instalar programas/extensões               8 Mapa dos programas e pendencias'
+        Write-Host '10 Fazer backup da Central                  11 Restaurar backup em pasta separada'
+        Write-Host '13 Chaves de IA (OpenAI/Gemini) do Bitwarden para este PC'
+        Write-Host '9 Atualizar código do pedro-ambiente         0 Sair'
         $opcao = Read-Host 'Opção'
         switch ($opcao) {
             '1' { Instalar-Ferramentas }
@@ -108,17 +113,38 @@ function Menu-Principal {
             '6' { Atualizar-Instalados }
             '7' { if ((Read-Host 'Ligar? (s = ligar, n = desligar)') -match '^[sS]') { Ativar-AtualizacaoAutomatica } else { Desativar-AtualizacaoAutomatica } }
             '8' { [void](Mostrar-Catalogo) }
+            '9' { Atualizar-Codigo -Pasta $raizRepo }
+            '10' { & (Join-Path $raizRepo 'scripts\Backup-Central.ps1') -Acao backup }
+            '11' { Restaurar-DadosCentral }
+            '13' { Configurar-ChavesIA }
         }
     } while ($opcao -ne '0')
 }
 
+function Restaurar-DadosCentral {
+    & (Join-Path $raizRepo 'scripts\Backup-Central.ps1') -Acao listar
+    $id=Read-Host 'ID do snapshot a restaurar'
+    $destino=Read-Host 'Pasta nova para restauração isolada'
+    if (-not $id -or -not $destino) { return }
+    & (Join-Path $raizRepo 'scripts\Backup-Central.ps1') -Acao restaurar -Snapshot $id -Destino $destino
+}
+
+function Sincronizar-DadosSegundoCerebro {
+    Write-Host 'Experimental: use a candidata e perfis ficticios antes de habilitar dados reais.'
+    $modo=Read-Host 'Digite ORIGEM somente para iniciar uma nuvem vazia a partir deste PC; Enter para receber/sincronizar'
+    if ($modo -and $modo -cne 'ORIGEM') { Write-Warning 'Opcao invalida; nada alterado.'; return }
+    & (Join-Path $raizRepo 'scripts\Sincronizar-SegundoCerebro.ps1') -Assistido -Inicializar:($modo -ceq 'ORIGEM')
+}
+
 function Executar-Instalar {
     $cat = Obter-Catalogo
-    $prontos = @($cat | Where-Object { $_.Tipo -eq 'instalavel' })
-    if ($prontos.Count -eq 0) { Write-Host 'Nenhum programa com release aprovada (.exe) ainda. Use scripts\Publicar-Release.ps1 depois de testar o build.' }
-    foreach ($i in Selecionar-Itens $prontos 'Programas prontos para instalar' { param($x) "$($x.Nome) v$($x.Versao)  [$($x.Conta)]" }) { Instalar-Programa $i }
-    $outros = @($cat | Where-Object { $_.Tipo -ne 'instalavel' -and $_.Tipo -ne 'projeto' })
-    if ($outros.Count) { Write-Host "`nNão instaláveis por aqui (web/extensão/em preparo): $(($outros | ForEach-Object { $_.Repo + ':' + $_.Tipo }) -join ', ')" }
+    $prontos = @($cat | Where-Object { -not $_.Erro -and $_.Tag -and
+        (($_.Tipo -eq 'instalavel' -and ($_.Asset -or $_.Pacote)) -or $_.Extensao) })
+    if ($prontos.Count -eq 0) { Write-Host 'Nenhum programa/extensão com release e contrato prontos para preparar. Confira as pendências abaixo.' }
+    foreach ($i in Selecionar-Itens $prontos 'Programas/extensões prontos para preparar' { param($x) "$($x.Nome) v$($x.Versao) [$($x.Tipo)] [$($x.Conta)]" }) { Instalar-Programa $i }
+    $outros = @($cat | Where-Object { $_.Erro -or ($_.Tipo -eq 'instalavel' -and (-not $_.Tag -or (-not $_.Asset -and -not $_.Pacote))) -or
+        ($_.Tipo -ne 'instalavel' -and -not $_.Extensao -and $_.Tipo -ne 'projeto') })
+    if ($outros.Count) { Write-Host "`nPendências: $(($outros | ForEach-Object { $_.Repo + ': ' + $_.Tipo + ' ' + $_.Erro }) -join '; ')" }
 }
 
 function Executar-Projetos {
@@ -134,6 +160,10 @@ switch ($Acao) {
     'Projetos' { Executar-Projetos }
     'Atualizar' { Atualizar-Instalados }
     'Catalogo' { [void](Mostrar-Catalogo) }
+    'Sincronizar' { Atualizar-Codigo -Pasta $raizRepo }
+    'Backup' { & (Join-Path $raizRepo 'scripts\Backup-Central.ps1') -Acao backup }
+    'Restaurar' { Restaurar-DadosCentral }
+    'Chaves' { Configurar-ChavesIA }
+    'Janela' { & (Join-Path $raizRepo 'scripts\Janela.ps1') -CriarAtalho }
     default { Menu-Principal }
 }
-
