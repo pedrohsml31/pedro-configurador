@@ -2,14 +2,14 @@
 #   powershell -ExecutionPolicy Bypass -File Configurar.ps1
 # Fora do repositório central, ele instala as ferramentas, autentica as contas, clona o repositório
 # central e continua a partir da cópia clonada. Dentro dele, mostra o menu.
-param([ValidateSet('Menu', 'Ferramentas', 'Contas', 'Regras', 'Instalar', 'Projetos', 'Atualizar', 'Catalogo', 'Sincronizar', 'Backup', 'Restaurar', 'Chaves', 'Janela')][string]$Acao = 'Menu')
+param([ValidateSet('Menu', 'Ferramentas', 'Contas', 'Regras', 'Instalar', 'Projetos', 'Atualizar', 'Catalogo', 'Sincronizar', 'Backup', 'Restaurar', 'Chaves', 'Produto', 'Janela', 'Auxiliares')][string]$Acao = 'Menu')
 
 $NOME_PROGRAMA = 'Ambiente do Pedro'
-$VERSAO = '5.6'
+$VERSAO = '5.9'
 $TITULO_PROGRAMA = "$NOME_PROGRAMA v$VERSAO"
 # Sem 'Stop' global: no PowerShell 5.1 o stderr de programas nativos (gh devolve 404 quando não há release) viraria exceção.
 $ErrorActionPreference = 'Continue'
-$ContasPadrao = @('pedrohsml31', 'contadescartavel26')
+$ContasPadrao = @('pedrohsml31')
 $RepoCentral = 'pedrohsml31/pedro-ambiente'
 
 function Atualizar-PathSessao {
@@ -33,7 +33,49 @@ function Instalar-Ferramentas {
         winget install --id $p.Id -e --scope user --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -ne 0) { Write-Warning "winget terminou com código $LASTEXITCODE para $($p.Id)." }
     }
+    Instalar-Auxiliares
     Atualizar-PathSessao
+}
+
+function Obter-Auxiliares {
+    # Programas auxiliares do dia a dia: id do winget, como reconhecer que já estão instalados (comando ou caminho).
+    $raizesProg = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA, "$env:LOCALAPPDATA\Programs") | Where-Object { $_ }
+    @(
+        @{ Nome = 'Bitwarden'; Id = 'Bitwarden.Bitwarden'; Cmd = $null; Caminhos = @($raizesProg | ForEach-Object { Join-Path $_ 'Bitwarden\Bitwarden.exe' }) }
+        @{ Nome = 'Google Drive'; Id = 'Google.GoogleDrive'; Cmd = $null; Caminhos = @("$env:ProgramFiles\Google\Drive File Stream") }
+        @{ Nome = 'Google Chrome'; Id = 'Google.Chrome'; Cmd = $null; Caminhos = @($raizesProg | ForEach-Object { Join-Path $_ 'Google\Chrome\Application\chrome.exe' }) }
+        @{ Nome = 'Node.js LTS'; Id = 'OpenJS.NodeJS.LTS'; Cmd = 'node'; Caminhos = @() }
+        @{ Nome = 'Python'; Id = 'Python.Python.3.12'; Cmd = 'py'; Caminhos = @() }
+        @{ Nome = 'Claude Code'; Id = 'Anthropic.ClaudeCode'; Cmd = 'claude'; Caminhos = @() }
+        @{ Nome = 'Codex'; Id = 'OpenAI.Codex'; Cmd = 'codex'; Caminhos = @(Join-Path $env:USERPROFILE '.codex\config.toml') }
+        @{ Nome = 'Antigravity'; Id = 'Google.Antigravity'; Cmd = 'agy'; Caminhos = @($raizesProg | ForEach-Object { Join-Path $_ 'Antigravity\Antigravity.exe' }) }
+    )
+}
+
+function Testar-Auxiliar {
+    param($A)
+    Atualizar-PathSessao
+    if ($A.Cmd -and (Get-Command $A.Cmd -ErrorAction SilentlyContinue)) { return $true }
+    foreach ($c in $A.Caminhos) { if ($c -and (Test-Path -Path $c)) { return $true } }
+    return $false
+}
+
+function Instalar-Auxiliares {
+    param([switch]$SoConferir)
+    Write-Host "`nProgramas auxiliares$(if ($SoConferir) { ' (só conferir)' })"
+    $faltam = @()
+    foreach ($a in Obter-Auxiliares) {
+        if (Testar-Auxiliar $a) { Write-Host "  ok       $($a.Nome)"; continue }
+        if ($SoConferir) { Write-Host "  FALTA    $($a.Nome)"; $faltam += $a.Nome; continue }
+        Write-Host "  instalando $($a.Nome)..."
+        winget install --id $a.Id -e --scope user --accept-package-agreements --accept-source-agreements *>$null
+        if (-not (Testar-Auxiliar $a)) {
+            # alguns instaladores não têm modo por usuário; tenta o padrão (pode pedir confirmação de administrador)
+            winget install --id $a.Id -e --accept-package-agreements --accept-source-agreements *>$null
+        }
+        if (Testar-Auxiliar $a) { Write-Host "  instalado $($a.Nome)" } else { Write-Host "  FALTA    $($a.Nome) (instale à mão ou rode de novo)"; $faltam += $a.Nome }
+    }
+    if ($faltam.Count) { Write-Warning "Ainda faltam: $($faltam -join ', ')." } else { Write-Host '  Todos os auxiliares conferidos.' }
 }
 
 function Autenticar-Contas {
@@ -82,7 +124,7 @@ function Aplicar-Regras {
     if ((Read-Host 'Aplicar estas regras? Cópias .bak-<data> serão guardadas (s/N)') -notmatch '^[sS]') { return }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
     foreach ($alvo in chezmoi managed --include=files --path-style=absolute --source $fonte --destination $HOME) {
-        if (Test-Path -LiteralPath $alvo) { Copy-Item -LiteralPath $alvo -Destination "$alvo.bak-$stamp" }
+        if (Test-Path -LiteralPath $alvo) { [void](Copiar-ArquivoSemSobrescrever -Origem $alvo -Destino "$alvo.bak-$stamp") }
     }
     chezmoi apply --source $fonte --destination $HOME --force
     Write-Host 'Regras aplicadas.'
@@ -102,6 +144,7 @@ function Menu-Principal {
         Write-Host '4 Instalar programas/extensões               8 Mapa dos programas e pendencias'
         Write-Host '10 Fazer backup da Central                  11 Restaurar backup em pasta separada'
         Write-Host '13 Chaves de IA (OpenAI/Gemini) do Bitwarden para este PC'
+        Write-Host '14 Ferramentas de produto e automação (Impeccable, Frontend Design, Playwright e DevTools MCP)'
         Write-Host '9 Atualizar código do pedro-ambiente         0 Sair'
         $opcao = Read-Host 'Opção'
         switch ($opcao) {
@@ -111,12 +154,13 @@ function Menu-Principal {
             '4' { Executar-Instalar }
             '5' { Executar-Projetos }
             '6' { Atualizar-Instalados }
-            '7' { if ((Read-Host 'Ligar? (s = ligar, n = desligar)') -match '^[sS]') { Ativar-AtualizacaoAutomatica } else { Desativar-AtualizacaoAutomatica } }
+            '7' { if ((Read-Host 'Ligar? (s = ligar, n = desligar)') -match '^[sS]') { [void](Ativar-AtualizacaoAutomatica) } else { Desativar-AtualizacaoAutomatica } }
             '8' { [void](Mostrar-Catalogo) }
             '9' { Atualizar-Codigo -Pasta $raizRepo }
             '10' { & (Join-Path $raizRepo 'scripts\Backup-Central.ps1') -Acao backup }
             '11' { Restaurar-DadosCentral }
             '13' { Configurar-ChavesIA }
+            '14' { & (Join-Path $raizRepo 'scripts\Instalar-Ferramentas.ps1') }
         }
     } while ($opcao -ne '0')
 }
@@ -140,6 +184,9 @@ function Executar-Instalar {
     $cat = Obter-Catalogo
     $prontos = @($cat | Where-Object { -not $_.Erro -and $_.Tag -and
         (($_.Tipo -eq 'instalavel' -and ($_.Asset -or $_.Pacote)) -or $_.Extensao) })
+    $todos = $prontos.Count
+    $prontos = @(Filtrar-ProgramasDoPC $prontos)
+    if ($prontos.Count -lt $todos) { Write-Host "PC da PF: $($todos - $prontos.Count) programa(s) sem marca de trabalho ficam fora da lista." }
     if ($prontos.Count -eq 0) { Write-Host 'Nenhum programa/extensão com release e contrato prontos para preparar. Confira as pendências abaixo.' }
     foreach ($i in Selecionar-Itens $prontos 'Programas/extensões prontos para preparar' { param($x) "$($x.Nome) v$($x.Versao) [$($x.Tipo)] [$($x.Conta)]" }) { Instalar-Programa $i }
     $outros = @($cat | Where-Object { $_.Erro -or ($_.Tipo -eq 'instalavel' -and (-not $_.Tag -or (-not $_.Asset -and -not $_.Pacote))) -or
@@ -164,6 +211,8 @@ switch ($Acao) {
     'Backup' { & (Join-Path $raizRepo 'scripts\Backup-Central.ps1') -Acao backup }
     'Restaurar' { Restaurar-DadosCentral }
     'Chaves' { Configurar-ChavesIA }
+    'Produto' { & (Join-Path $raizRepo 'scripts\Instalar-Ferramentas.ps1') }
     'Janela' { & (Join-Path $raizRepo 'scripts\Janela.ps1') -CriarAtalho }
+    'Auxiliares' { Instalar-Auxiliares -SoConferir }
     default { Menu-Principal }
 }
